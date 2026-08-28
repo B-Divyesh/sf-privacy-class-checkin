@@ -1,5 +1,9 @@
 # Handoff — Privacy Class Check-in
 
+## Independent verification result: **FAIL**
+
+Verified on 2026-08-28 against candidate `9e33cb48648ccb517cabe7b296733300f6e36b59` and <https://privacy-class-checkin.sociobot.in>. See `.factory/verification-1.md` for exact evidence. The product flows, local tests/build, live static candidate hashes, accessibility, privacy checks, and mobile behavior pass. Do **not** release yet: live `/health` reports `buildSha: "development"` rather than the candidate SHA; live static responses have no `Cache-Control` policy; and the service worker uses an unversioned release cache (`pcc-shell-v1`). Set immutable `BUILD_SHA`, add immutable hashed-asset/short HTML-and-SW caching, version the SW cache, then redeploy and reverify.
+
 Completed 2026-08-28 for work order `privacy-class-checkin-build-1`.
 
 ## What was built
