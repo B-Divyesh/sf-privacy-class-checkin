@@ -764,7 +764,10 @@ async fn main() {
         }
     }
     let pool = SqlitePoolOptions::new()
-        .max_connections(8)
+        // SQLite is intentionally the persistence boundary for this small,
+        // single-replica product. One connection prevents an Azure Files mount
+        // from seeing competing SQLite file locks during startup or writes.
+        .max_connections(1)
         .connect(&database_url)
         .await
         .expect("connect sqlite");
