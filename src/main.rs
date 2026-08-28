@@ -18,8 +18,10 @@ use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::{
     collections::VecDeque,
     env,
+    fs::{self, OpenOptions},
+    io::{self, Read, Write},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -67,6 +69,88 @@ fn random_secret(bytes: usize) -> String {
     let mut value = vec![0u8; bytes];
     rand::thread_rng().fill_bytes(&mut value);
     hex::encode(value)
+}
+
+/// Returns a stable signing secret without requiring operators to supply one.
+///
+/// The database and this file deliberately live together: a local SQLite database
+/// is a single-instance deployment boundary, and its exports must remain
+/// verifiable after a normal container restart. An explicit environment value is
+/// still supported for managed-secret deployments.
+fn signing_secret_path(database_url: &str) -> Option<PathBuf> {
+    let database_file = database_url
+        .strip_prefix("sqlite://")?
+        .split('?')
+        .next()
+        .filter(|path| !path.is_empty() && *path != ":memory:")?;
+    let path = PathBuf::from(database_file);
+    Some(path.with_extension("export-signing-key"))
+}
+
+fn read_or_create_signing_secret(path: &FsPath) -> io::Result<(String, bool)> {
+    if let Ok(mut file) = OpenOptions::new().read(true).open(path) {
+        let mut existing = String::new();
+        file.read_to_string(&mut existing)?;
+        if !existing.trim().is_empty() {
+            return Ok((existing.trim().to_owned(), false));
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let generated = random_secret(32);
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            }
+            file.write_all(generated.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            Ok((generated, true))
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            // Another process created it between our first read and create. Read
+            // its value so both processes retain one signing identity.
+            let mut existing = String::new();
+            OpenOptions::new()
+                .read(true)
+                .open(path)?
+                .read_to_string(&mut existing)?;
+            if existing.trim().is_empty() {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "persisted export signing key is empty",
+                ))
+            } else {
+                Ok((existing.trim().to_owned(), false))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn load_signing_secret(database_url: &str) -> io::Result<(String, &'static str)> {
+    if let Ok(secret) = env::var("EXPORT_SIGNING_KEY") {
+        if secret.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "EXPORT_SIGNING_KEY must not be empty",
+            ));
+        }
+        return Ok((secret, "supplied"));
+    }
+    let path = signing_secret_path(database_url).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a file-backed SQLite DATABASE_URL is required without EXPORT_SIGNING_KEY",
+        )
+    })?;
+    let (secret, generated) = read_or_create_signing_secret(&path)?;
+    Ok((secret, if generated { "generated" } else { "persisted" }))
 }
 
 fn hash(value: &str) -> String {
@@ -664,7 +748,10 @@ async fn shutdown_signal() {
 async fn main() {
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
     let database_url =
         env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://data/checkin.db?mode=rwc".into());
@@ -682,10 +769,9 @@ async fn main() {
         .await
         .expect("connect sqlite");
     migrate(&pool).await.expect("migrate database");
-    let signing_secret = env::var("EXPORT_SIGNING_KEY").unwrap_or_else(|_| {
-        tracing::warn!("EXPORT_SIGNING_KEY is unset; using an ephemeral key");
-        random_secret(32)
-    });
+    let (signing_secret, signing_key_source) =
+        load_signing_secret(&database_url).expect("load or create persisted export signing key");
+    tracing::info!(signing_key_source, "export signing key configured");
     let signing_bytes: [u8; 32] = Sha256::digest(signing_secret.as_bytes()).into();
     let state = AppState {
         pool: pool.clone(),
@@ -747,6 +833,34 @@ mod tests {
     fn csv_escapes_formula_and_quotes_as_data() {
         assert_eq!(csv_cell("a\"b"), "\"a\"\"b\"");
         assert_eq!(csv_cell("=1+1"), "\"'=1+1\"");
+    }
+
+    #[test]
+    fn generated_signing_key_persists_beside_sqlite_database() {
+        let root = std::env::temp_dir().join(format!("pcc-signing-key-{}", Uuid::new_v4()));
+        let database_url = format!("sqlite://{}?mode=rwc", root.join("checkin.db").display());
+        let (first, first_source) = load_signing_secret(&database_url).unwrap();
+        let (second, second_source) = load_signing_secret(&database_url).unwrap();
+        assert_eq!(first_source, "generated");
+        assert_eq!(second_source, "persisted");
+        assert_eq!(first, second);
+        let first_key: [u8; 32] = Sha256::digest(first.as_bytes()).into();
+        let second_key: [u8; 32] = Sha256::digest(second.as_bytes()).into();
+        assert_eq!(
+            SigningKey::from_bytes(&first_key).verifying_key(),
+            SigningKey::from_bytes(&second_key).verifying_key()
+        );
+        let key = root.join("checkin.export-signing-key");
+        assert!(key.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

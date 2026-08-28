@@ -21,7 +21,7 @@ Requirements: Node 22+, Rust 1.88+, and SQLite runtime support.
 ```sh
 npm ci
 npm run build
-DATABASE_URL='sqlite://data/checkin.db?mode=rwc' EXPORT_SIGNING_KEY='development-only-key' cargo run
+DATABASE_URL='sqlite://data/checkin.db?mode=rwc' cargo run
 ```
 
 Open `http://localhost:8080`. For frontend hot reload, run `npm run dev` in a second terminal; Vite proxies `/api` to port 8080.
@@ -30,7 +30,7 @@ Configuration is environment-only:
 
 - `PORT` — HTTP port, default `8080`
 - `DATABASE_URL` — SQLite URL, default `sqlite://data/checkin.db?mode=rwc`
-- `EXPORT_SIGNING_KEY` — stable private input used to derive the Ed25519 export key; set a long deployment secret
+- `EXPORT_SIGNING_KEY` — optional stable private input used to derive the Ed25519 export key. If unset, the service generates a CSPRNG value once beside the SQLite file (mode `0600`) and reuses it after restart.
 - `BUILD_SHA` — returned by `/health`
 - `DIST_DIR` — built frontend location, default `dist`
 
@@ -41,7 +41,7 @@ npm test             # frontend unit + Rust unit/integration tests
 npm run build        # reproducible frontend output in dist/
 npm run test:e2e     # Chromium desktop + mobile flow
 docker build --build-arg BUILD_SHA="$(git rev-parse HEAD)" -t privacy-class-checkin .
-docker run --rm -p 8080:8080 -e EXPORT_SIGNING_KEY='replace-me' -v checkin-data:/app/data privacy-class-checkin
+docker run --rm -p 8080:8080 -v checkin-data:/app/data privacy-class-checkin
 ```
 
 The container runs as UID 10001, exposes port 8080, serves frontend and API from one origin, and stores SQLite data under `/app/data`.
@@ -52,6 +52,6 @@ No analytics, third-party scripts, remote fonts, location, biometrics, or device
 
 ## Deploy
 
-The factory deploys the root `Dockerfile`. Provide persistent `/app/data`, a stable `EXPORT_SIGNING_KEY`, and the immutable commit as Docker build argument `BUILD_SHA`; it is returned by `/health` and versions the offline shell cache. Hashed `/assets/*` responses are immutable for one year, while HTML, the manifest, and `/sw.js` revalidate on each request. Do not place a CDN in front of `/api` that caches responses. The canonical URL is <https://privacy-class-checkin.sociobot.in>.
+The factory deploys the root `Dockerfile`. This SQLite product must run as **one stateful replica** with a persistent `/app/data` volume; do not horizontally scale it without moving persistence to a shared database. The service generates and persists its own export-signing key in that volume when no `EXPORT_SIGNING_KEY` override is supplied. Pass the immutable commit as Docker build argument `BUILD_SHA`; it is returned by `/health` and versions the offline shell cache. Hashed `/assets/*` responses are immutable for one year, while HTML, the manifest, and `/sw.js` revalidate on each request. Do not place a CDN in front of `/api` that caches responses. The canonical URL is <https://privacy-class-checkin.sociobot.in>.
 
 MIT licensed. See [LICENSE](LICENSE).
