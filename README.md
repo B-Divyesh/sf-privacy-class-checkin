@@ -21,7 +21,7 @@ Requirements: Node 22+, Rust 1.88+, and SQLite runtime support.
 ```sh
 npm ci
 npm run build
-DATABASE_URL='sqlite://data/checkin.db?mode=rwc' cargo run
+DATABASE_URL='sqlite://data/checkin.db?mode=rwc&nolock=1' cargo run
 ```
 
 Open `http://localhost:8080`. For frontend hot reload, run `npm run dev` in a second terminal; Vite proxies `/api` to port 8080.
@@ -29,7 +29,7 @@ Open `http://localhost:8080`. For frontend hot reload, run `npm run dev` in a se
 Configuration is environment-only:
 
 - `PORT` — HTTP port, default `8080`
-- `DATABASE_URL` — SQLite URL, default `sqlite://data/checkin.db?mode=rwc`
+- `DATABASE_URL` — SQLite URL, default `sqlite://data/checkin.db?mode=rwc&nolock=1`; `nolock=1` is safe only because the production contract is one replica and one SQLite connection on Azure Files.
 - `EXPORT_SIGNING_KEY` — optional stable private input used to derive the Ed25519 export key. If unset, the service generates a CSPRNG value once beside the SQLite file (mode `0600`) and reuses it after restart.
 - `BUILD_SHA` — returned by `/health`
 - `DIST_DIR` — built frontend location, default `dist`
