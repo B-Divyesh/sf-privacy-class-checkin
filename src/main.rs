@@ -753,8 +753,8 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    let database_url = env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite://data/checkin.db?mode=rwc&nolock=1".into());
+    let database_url =
+        env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://data/checkin.db?mode=rwc".into());
     if let Some(file) = database_url
         .strip_prefix("sqlite://")
         .and_then(|v| v.split('?').next())
