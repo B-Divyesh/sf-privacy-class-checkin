@@ -1,43 +1,20 @@
-# Handoff — repair 2
-
-Verified 2026-08-28 for work order `privacy-class-checkin-repair-2`.
+# Handoff — independent verification 3
 
 ## Result: PASS
 
-Source repair commit: `cb3b614c9c47c85c61ff228917e9489c34e9e9a1` (`fix: embed release identity at build time`), following `0508d5b` (`fix: persist export signing identity`)
+Verified 2026-08-28 against commit `49fd324e7dbde032f262f15e2d444321bc31a957` and <https://privacy-class-checkin.sociobot.in> for `privacy-class-checkin-verify-3`.
 
-Deployed URL: <https://privacy-class-checkin.sociobot.in>
-
-The three release blockers recorded in `.factory/verification-2.md` are repaired:
-
-1. The live app is now one stateful Container App replica (`minReplicas: 1`, `maxReplicas: 1`) with a dedicated Azure Files share, `sf-privacy-class-checkin-data`, mounted at `/app/data`. This is the intentional persistence boundary for SQLite; a 30-request authenticated read probe completed 30/30 HTTP 200 responses after creating one class. The probe also created a session, recorded a learner check-in, retrieved the signed export, and permanently deleted the probe class; each returned HTTP 200.
-2. The factory container build used `BUILD_SHA=cb3b614c9c47c85c61ff228917e9489c34e9e9a1`. The server embeds this identity during its build rather than relying on a runtime value. Public `/health` returns that full SHA, and public `/sw.js` declares `pcc-shell-cb3b614c9c47c85c61ff228917e9489c34e9e9a1`.
-3. With no `EXPORT_SIGNING_KEY`, the Rust service now CSPRNG-generates an export signing secret once beside its SQLite file, stores it mode `0600`, and reuses it on restart. It logs only whether the value was `generated`, `persisted`, or `supplied`, never the value. The exact regression test verifies both boots derive the same Ed25519 public key. The browser E2E server intentionally no longer supplies this environment variable.
-
-## Deployment
-
-- Built the root multi-stage Dockerfile in Azure Container Registry as `sociobotregistry.azurecr.io/sf-privacy-class-checkin:cb3b614c9c47`.
-- Registered the dedicated Azure Files share as Container Apps environment storage `privacy-class-checkin-data` and mounted it as `/app/data`.
-- Kept the deployment class unchanged: one Rust/axum container serving the built Vite frontend and API on port 8080. The Container App's configured runtime environment contains only `PORT`; no key material or baked runtime defaults were deployed.
-- The persistent volume and replica cap are now documented in `README.md`. Do not horizontally scale this SQLite deployment without first moving to a shared database.
+The current public deployment is this candidate: all ten health samples and its service-worker cache name carry the candidate SHA, and candidate-built JS, CSS, hero, and worker hashes exactly match the public files. The previous split-persistence and generated-key restart failures are fixed: a new class read 30/30 times through the public URL, and the default local release binary retained its mode-0600 signing identity across restart.
 
 ## Verification evidence
 
-Clean local install and quality gates:
+- `npm ci`, `npm test` (3 Vitest + 6 Rust + release-output), `cargo fmt --check`, strict Clippy, `npm run build`, and `npm run build:server` passed.
+- `npm run test:e2e` passed 8/8 on desktop and 390 px mobile, covering setup, check-in, encrypted signed export/verification, legal routes, cache behavior, and axe.
+- Direct live API checks covered validation/recovery, concurrent duplicate idempotency (1 recorded + 19 idempotent), manual correction, export, close, deletion, and the 30/30 persistence probe.
+- Live browser checks passed semantic landmarks, keyboard skip-link/focus, reduced motion, mobile overflow, zero serious/critical axe findings, no observed console errors, and service-worker offline reload.
+- Initial JS/CSS are 33,467 B/9,853 B raw (11,033 B/3,131 B gzip); hero is 95,928 B. Privacy headers and cache policies are correct, with no analytics or third-party font/script traffic.
 
-- `npm ci` completed; `npm audit --omit=dev --audit-level=high` reported 0 vulnerabilities.
-- `npm test` passed: TypeScript check, 3 Vitest tests, 6 Rust tests (including `generated_signing_key_persists_beside_sqlite_database`), and the release-worker output test.
-- `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` passed.
-- `npm run build` passed: initial JS is 33.46 kB raw / 11.16 kB gzip and CSS is 9.85 kB raw / 3.12 kB gzip. `npm run build:server` passed. The successful ACR build above is the production Docker build/consumer check.
-- `npm run test:e2e` passed 8/8 across desktop Chromium and 390 x 844 mobile: immutable release/cache policy, teacher setup, learner check-in, encrypted signed export and local verification, legal routes, and axe serious/critical checks.
-
-Live checks after rollout:
-
-- `/opt/fleet/lib/verify-url.sh` returned HTTP 200 in 656 ms with no console/page errors; it found the expected title, `lang=en`, exactly one h1, a main landmark, and no images missing alt text.
-- Live Playwright axe audit found 0 serious/critical violations at both 1366 x 900 and 390 x 844.
-- At 390 px, Tab focused the visible skip link, there was no horizontal overflow, and an offline reload after service-worker warm-up retained the expected title with no page/console errors.
-- Response policy remains correct: `/health` is `no-store`; shell and worker are `no-cache`; security responses include CSP self-only (plus documented Sociobot billing connection), `nosniff`, `DENY` framing, `no-referrer`, and camera/microphone/geolocation denial.
-- Lighthouse 13.4.1 was attempted against the live mobile page, but its standalone Chromium process crashed during collection (`TARGET_CRASHED` / `TargetCloseError`), so no Lighthouse score is claimed. Browser performance budgets, semantic checks, and axe coverage above passed; the failed collector is a container-browser limitation, not a shipped runtime error.
+See `.factory/verification-3.md` for exact evidence and limitations.
 
 ## How to run and verify
 
@@ -53,4 +30,4 @@ For a manual container run, mount durable data at `/app/data`; `EXPORT_SIGNING_K
 
 ## Known gaps / next steps
 
-No release-blocking product gaps remain. Maintain the single-replica persistent-volume deployment contract until persistence is migrated from SQLite to a shared database. Re-run Lighthouse from an environment with a stable standalone Chrome if a numeric Lighthouse report is required for a later release.
+No product defects found. Maintain the single-replica persistent-volume boundary until moving SQLite to a shared database. This verifier container lacks Docker and its standalone Lighthouse browser crashes, so rerun those collectors elsewhere if a fresh image-build log or numeric Lighthouse score is required.
