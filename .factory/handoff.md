@@ -4,21 +4,21 @@ Verified 2026-08-28 for work order `privacy-class-checkin-repair-2`.
 
 ## Result: PASS
 
-Source repair commit: `0508d5b1bcc75c43db17f5254a93214a781f719e` (`fix: persist export signing identity`)
+Source repair commit: `cb3b614c9c47c85c61ff228917e9489c34e9e9a1` (`fix: embed release identity at build time`), following `0508d5b` (`fix: persist export signing identity`)
 
 Deployed URL: <https://privacy-class-checkin.sociobot.in>
 
 The three release blockers recorded in `.factory/verification-2.md` are repaired:
 
 1. The live app is now one stateful Container App replica (`minReplicas: 1`, `maxReplicas: 1`) with a dedicated Azure Files share, `sf-privacy-class-checkin-data`, mounted at `/app/data`. This is the intentional persistence boundary for SQLite; a 30-request authenticated read probe completed 30/30 HTTP 200 responses after creating one class. The probe also created a session, recorded a learner check-in, retrieved the signed export, and permanently deleted the probe class; each returned HTTP 200.
-2. The factory container build used `BUILD_SHA=0508d5b1bcc75c43db17f5254a93214a781f719e`. Ten independent public `/health` requests all returned that full SHA, and public `/sw.js` declares `pcc-shell-0508d5b1bcc75c43db17f5254a93214a781f719e`.
+2. The factory container build used `BUILD_SHA=cb3b614c9c47c85c61ff228917e9489c34e9e9a1`. The server embeds this identity during its build rather than relying on a runtime value. Public `/health` returns that full SHA, and public `/sw.js` declares `pcc-shell-cb3b614c9c47c85c61ff228917e9489c34e9e9a1`.
 3. With no `EXPORT_SIGNING_KEY`, the Rust service now CSPRNG-generates an export signing secret once beside its SQLite file, stores it mode `0600`, and reuses it on restart. It logs only whether the value was `generated`, `persisted`, or `supplied`, never the value. The exact regression test verifies both boots derive the same Ed25519 public key. The browser E2E server intentionally no longer supplies this environment variable.
 
 ## Deployment
 
-- Built the root multi-stage Dockerfile in Azure Container Registry as `sociobotregistry.azurecr.io/sf-privacy-class-checkin:0508d5b1bcc7`.
+- Built the root multi-stage Dockerfile in Azure Container Registry as `sociobotregistry.azurecr.io/sf-privacy-class-checkin:cb3b614c9c47`.
 - Registered the dedicated Azure Files share as Container Apps environment storage `privacy-class-checkin-data` and mounted it as `/app/data`.
-- Kept the deployment class unchanged: one Rust/axum container serving the built Vite frontend and API on port 8080. The runtime environment supplies only `PORT`; no key material was deployed.
+- Kept the deployment class unchanged: one Rust/axum container serving the built Vite frontend and API on port 8080. The Container App's configured runtime environment contains only `PORT`; no key material or baked runtime defaults were deployed.
 - The persistent volume and replica cap are now documented in `README.md`. Do not horizontally scale this SQLite deployment without first moving to a shared database.
 
 ## Verification evidence
