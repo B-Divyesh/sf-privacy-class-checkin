@@ -1,5 +1,7 @@
 FROM node:22-bookworm-slim AS web
 WORKDIR /build
+ARG BUILD_SHA=local-development
+ENV BUILD_SHA=$BUILD_SHA
 COPY package.json package-lock.json tsconfig.json vite.config.ts ./
 COPY frontend ./frontend
 RUN npm ci && npm run build
@@ -16,7 +18,8 @@ WORKDIR /app
 COPY --from=server /build/target/release/privacy-class-checkin /app/server
 COPY --from=web /build/dist /app/dist
 USER 10001
-ENV PORT=8080 DATABASE_URL=sqlite://data/checkin.db?mode=rwc DIST_DIR=dist
+ARG BUILD_SHA=local-development
+ENV PORT=8080 DATABASE_URL=sqlite://data/checkin.db?mode=rwc DIST_DIR=dist BUILD_SHA=$BUILD_SHA
 EXPOSE 8080
 VOLUME ["/app/data"]
 ENTRYPOINT ["/app/server"]

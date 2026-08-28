@@ -40,7 +40,7 @@ Configuration is environment-only:
 npm test             # frontend unit + Rust unit/integration tests
 npm run build        # reproducible frontend output in dist/
 npm run test:e2e     # Chromium desktop + mobile flow
-docker build -t privacy-class-checkin .
+docker build --build-arg BUILD_SHA="$(git rev-parse HEAD)" -t privacy-class-checkin .
 docker run --rm -p 8080:8080 -e EXPORT_SIGNING_KEY='replace-me' -v checkin-data:/app/data privacy-class-checkin
 ```
 
@@ -52,6 +52,6 @@ No analytics, third-party scripts, remote fonts, location, biometrics, or device
 
 ## Deploy
 
-The factory deploys the root `Dockerfile`. Provide persistent `/app/data`, a stable `EXPORT_SIGNING_KEY`, and the build SHA. Do not place a CDN in front of `/api` that caches responses. The canonical URL is <https://privacy-class-checkin.sociobot.in>.
+The factory deploys the root `Dockerfile`. Provide persistent `/app/data`, a stable `EXPORT_SIGNING_KEY`, and the immutable commit as Docker build argument `BUILD_SHA`; it is returned by `/health` and versions the offline shell cache. Hashed `/assets/*` responses are immutable for one year, while HTML, the manifest, and `/sw.js` revalidate on each request. Do not place a CDN in front of `/api` that caches responses. The canonical URL is <https://privacy-class-checkin.sociobot.in>.
 
 MIT licensed. See [LICENSE](LICENSE).

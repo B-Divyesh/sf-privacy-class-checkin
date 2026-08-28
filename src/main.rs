@@ -117,6 +117,43 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
     response
 }
 
+fn is_hashed_asset(path: &str) -> bool {
+    let Some(file) = path.strip_prefix("/assets/") else {
+        return false;
+    };
+    let Some((stem, _extension)) = file.rsplit_once('.') else {
+        return false;
+    };
+    let Some((_name, fingerprint)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    fingerprint.len() >= 8
+        && fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn cache_control(path: &str) -> &'static str {
+    if path.starts_with("/api/") || path == "/health" {
+        "no-store"
+    } else if is_hashed_asset(path) {
+        "public, max-age=31536000, immutable"
+    } else {
+        // HTML fallbacks, the manifest, and sw.js must be checked on every
+        // navigation so a new release can take control without a stale shell.
+        "no-cache"
+    }
+}
+
+async fn cache_headers(request: Request<Body>, next: Next) -> Response {
+    let policy = cache_control(request.uri().path());
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static(policy));
+    response
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateClass {
@@ -599,6 +636,7 @@ fn app(state: AppState, dist: PathBuf) -> Router {
     Router::new()
         .merge(api)
         .fallback_service(ServeDir::new(&dist).fallback(ServeFile::new(dist.join("index.html"))))
+        .layer(middleware::from_fn(cache_headers))
         .layer(middleware::from_fn(security_headers))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -709,6 +747,65 @@ mod tests {
     fn csv_escapes_formula_and_quotes_as_data() {
         assert_eq!(csv_cell("a\"b"), "\"a\"\"b\"");
         assert_eq!(csv_cell("=1+1"), "\"'=1+1\"");
+    }
+
+    #[tokio::test]
+    async fn health_and_static_responses_have_release_safe_cache_policies() {
+        let dist = std::env::temp_dir().join(format!("pcc-cache-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(dist.join("assets")).unwrap();
+        std::fs::write(
+            dist.join("index.html"),
+            "<!doctype html><title>test</title>",
+        )
+        .unwrap();
+        std::fs::write(dist.join("sw.js"), "// generated worker").unwrap();
+        std::fs::write(dist.join("assets/app-AbCdEfg1.js"), "export {};").unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        migrate(&pool).await.unwrap();
+        let service = app(
+            AppState {
+                pool,
+                signing_key: Arc::new(SigningKey::from_bytes(&[9u8; 32])),
+                build_sha: "immutable-release-sha".into(),
+                checkin_attempts: Arc::new(Mutex::new(VecDeque::new())),
+            },
+            dist.clone(),
+        );
+
+        let health = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(json_body(health).await["buildSha"], "immutable-release-sha");
+
+        for (uri, expected) in [
+            (
+                "/assets/app-AbCdEfg1.js",
+                "public, max-age=31536000, immutable",
+            ),
+            ("/sw.js", "no-cache"),
+            ("/privacy", "no-cache"),
+        ] {
+            let response = service
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], expected, "{uri}");
+        }
+        std::fs::remove_dir_all(dist).unwrap();
     }
 
     async fn json_body(response: Response) -> serde_json::Value {

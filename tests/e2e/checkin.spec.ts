@@ -2,6 +2,20 @@ import { expect, test } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 import { readFile } from 'node:fs/promises';
 
+test('identifies the release and applies cache policy to the offline shell', async ({ page, request }) => {
+  const health = await request.get('/health');
+  expect(health.headers()['cache-control']).toBe('no-store');
+  await expect(health.json()).resolves.toEqual({ status: 'ok', buildSha: 'e2e-regression' });
+
+  await page.goto('/');
+  const moduleSrc = await page.locator('script[type="module"]').getAttribute('src');
+  const asset = await request.get(moduleSrc!);
+  expect(asset.headers()['cache-control']).toBe('public, max-age=31536000, immutable');
+  const worker = await request.get('/sw.js');
+  expect(worker.headers()['cache-control']).toBe('no-cache');
+  await expect(worker.text()).resolves.toMatch(/const CACHE="pcc-shell-e2e-regression";/);
+});
+
 test('teacher creates a class and learner checks in', async ({ page, context }, testInfo) => {
   const errors:string[]=[]; page.on('console',message=>{if(message.type()==='error')errors.push(message.text())});
   await page.goto('/');
