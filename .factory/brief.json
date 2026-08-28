@@ -1,0 +1,11 @@
+{
+  "slug": "privacy-class-checkin",
+  "title": "Privacy Class Check-in",
+  "territory": "utilities",
+  "user": "A teacher running a small class who needs a quick attendance signal but does not want biometrics, continuous location tracking, or a student-surveillance product.",
+  "smallest_useful_product": "Teacher-hosted local web page generates a rotating session code; students submit a pseudonymous roster token, and the teacher exports a signed present/late/absent CSV.",
+  "success_measure": "A 30-student class completes a check-in in under two minutes, with no location or biometric fields stored and fewer than two manual corrections per session.",
+  "artifact_class": "web-with-backend",
+  "monetization": "one-time",
+  "constraints": "Make limitations explicit: presence of a device is not proof of attendance; encrypt roster exports; support data-retention deletion and accessible manual fallback."
+}
