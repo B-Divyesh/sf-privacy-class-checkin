@@ -8,6 +8,8 @@ RUN npm ci && npm run build
 
 FROM rust:1.88-bookworm AS server
 WORKDIR /build
+ARG BUILD_SHA=local-development
+ENV BUILD_SHA=$BUILD_SHA
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release --locked
@@ -18,8 +20,6 @@ WORKDIR /app
 COPY --from=server /build/target/release/privacy-class-checkin /app/server
 COPY --from=web /build/dist /app/dist
 USER 10001
-ARG BUILD_SHA=local-development
-ENV PORT=8080 DATABASE_URL=sqlite://data/checkin.db?mode=rwc DIST_DIR=dist BUILD_SHA=$BUILD_SHA
 EXPOSE 8080
 VOLUME ["/app/data"]
 ENTRYPOINT ["/app/server"]

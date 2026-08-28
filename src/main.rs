@@ -776,7 +776,8 @@ async fn main() {
     let state = AppState {
         pool: pool.clone(),
         signing_key: Arc::new(SigningKey::from_bytes(&signing_bytes)),
-        build_sha: env::var("BUILD_SHA").unwrap_or_else(|_| "development".into()),
+        build_sha: env::var("BUILD_SHA")
+            .unwrap_or_else(|_| option_env!("BUILD_SHA").unwrap_or("development").to_owned()),
         checkin_attempts: Arc::new(Mutex::new(VecDeque::new())),
     };
     let cleanup_pool = pool.clone();
