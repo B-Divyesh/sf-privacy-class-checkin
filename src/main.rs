@@ -27,7 +27,7 @@ use std::{
     path::{Path as FsPath, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use subtle::ConstantTimeEq;
 use tower_http::{
@@ -107,13 +107,71 @@ fn random_secret(bytes: usize) -> String {
 /// verifiable after a normal container restart. An explicit environment value is
 /// still supported for managed-secret deployments.
 fn signing_secret_path(database_url: &str) -> Option<PathBuf> {
-    let database_file = database_url
+    database_file_path(database_url).map(|path| path.with_extension("export-signing-key"))
+}
+
+fn database_file_path(database_url: &str) -> Option<PathBuf> {
+    database_url
         .strip_prefix("sqlite://")?
         .split('?')
         .next()
-        .filter(|path| !path.is_empty() && *path != ":memory:")?;
-    let path = PathBuf::from(database_file);
-    Some(path.with_extension("export-signing-key"))
+        .filter(|path| !path.is_empty() && *path != ":memory:")
+        .map(PathBuf::from)
+}
+
+struct StartupGuard {
+    path: PathBuf,
+}
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+async fn acquire_startup_guard(database_url: &str) -> io::Result<StartupGuard> {
+    let database = database_file_path(database_url).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "startup serialization needs a file-backed SQLite database",
+        )
+    })?;
+    let path = database.with_extension("startup-lock");
+    loop {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                writeln!(file, "{}", Utc::now().timestamp())?;
+                file.sync_all()?;
+                return Ok(StartupGuard { path });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                    .is_some_and(|age| age > Duration::from_secs(60));
+                if stale {
+                    let _ = fs::remove_file(&path);
+                } else {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn recover_empty_bootstrap(database_url: &str) -> io::Result<bool> {
+    let Some(database) = database_file_path(database_url) else {
+        return Ok(false);
+    };
+    let journal = PathBuf::from(format!("{}-journal", database.display()));
+    if fs::metadata(&database).is_ok_and(|metadata| metadata.len() == 0) && journal.exists() {
+        fs::remove_file(&journal)?;
+        fs::remove_file(&database)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn read_or_create_signing_secret(path: &FsPath) -> io::Result<(String, bool)> {
@@ -1233,6 +1291,12 @@ async fn main() {
             let _ = std::fs::create_dir_all(path);
         }
     }
+    let startup_guard = acquire_startup_guard(&database_url)
+        .await
+        .expect("serialize sqlite startup");
+    if recover_empty_bootstrap(&database_url).expect("recover an empty sqlite bootstrap") {
+        tracing::warn!("removed an incomplete empty sqlite bootstrap");
+    }
     let connect_options = SqliteConnectOptions::from_str(&database_url)
         .expect("parse sqlite database location")
         .busy_timeout(Duration::from_secs(120));
@@ -1245,6 +1309,7 @@ async fn main() {
         .await
         .expect("connect sqlite");
     migrate(&pool).await.expect("migrate database");
+    drop(startup_guard);
     let (signing_secret, signing_key_source) =
         load_signing_secret(&database_url).expect("load or create persisted export signing key");
     tracing::info!(
@@ -1988,6 +2053,40 @@ mod tests {
         .unwrap();
         assert_eq!(table_count, 4);
         first.close().await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_guard_serializes_replicas_and_recovers_only_an_empty_database() {
+        let root = std::env::temp_dir().join(format!("pcc-guard-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let database = root.join("checkin.db");
+        let journal = root.join("checkin.db-journal");
+        let database_url = format!("sqlite://{}?mode=rwc", database.display());
+        fs::write(&database, []).unwrap();
+        fs::write(&journal, b"incomplete bootstrap").unwrap();
+
+        let first = acquire_startup_guard(&database_url).await.unwrap();
+        assert!(recover_empty_bootstrap(&database_url).unwrap());
+        assert!(!database.exists());
+        assert!(!journal.exists());
+        let waiting_url = database_url.clone();
+        let waiting = tokio::spawn(async move { acquire_startup_guard(&waiting_url).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished());
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(second);
+        assert!(!root.join("checkin.startup-lock").exists());
+
+        fs::write(&database, b"real data").unwrap();
+        fs::write(&journal, b"journal").unwrap();
+        assert!(!recover_empty_bootstrap(&database_url).unwrap());
+        assert_eq!(fs::read(&database).unwrap(), b"real data");
         fs::remove_dir_all(root).unwrap();
     }
 }
