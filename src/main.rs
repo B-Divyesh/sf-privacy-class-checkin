@@ -14,7 +14,10 @@ use rand::{distributions::Alphanumeric, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    Row, SqlitePool,
+};
 use std::{
     collections::HashMap,
     env,
@@ -22,6 +25,7 @@ use std::{
     io::{self, Read, Write},
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
+    str::FromStr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -1025,19 +1029,44 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
 }
 
 async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query("PRAGMA foreign_keys=ON").execute(pool).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS classes(id TEXT PRIMARY KEY,name TEXT NOT NULL,teacher_key_hash TEXT NOT NULL,retention_days INTEGER NOT NULL,created_at INTEGER NOT NULL)").execute(pool).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS roster(id TEXT PRIMARY KEY,class_id TEXT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,alias TEXT NOT NULL,token_hash TEXT NOT NULL,created_at INTEGER NOT NULL,UNIQUE(class_id,token_hash))").execute(pool).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,class_id TEXT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,seed TEXT NOT NULL,started_at INTEGER NOT NULL,late_at INTEGER NOT NULL,ends_at INTEGER NOT NULL,closed_at INTEGER)").execute(pool).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS checkins(session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,roster_id TEXT NOT NULL REFERENCES roster(id) ON DELETE CASCADE,status TEXT NOT NULL,checked_at INTEGER NOT NULL,source TEXT NOT NULL,PRIMARY KEY(session_id,roster_id))").execute(pool).await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(ends_at,closed_at)")
-        .execute(pool)
+    let mut connection = pool.acquire().await?;
+    sqlx::query("PRAGMA foreign_keys=ON")
+        .execute(&mut *connection)
         .await?;
-    sqlx::query("DELETE FROM classes WHERE created_at + retention_days * 86400 < ?")
-        .bind(Utc::now().timestamp())
-        .execute(pool)
+
+    // Container Apps can briefly start two replicas during a rolling update,
+    // even though this service is constrained to one steady-state replica.
+    // Taking the write reservation before reading schema state avoids two
+    // starters deadlocking while both try to upgrade a read lock on /data.
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *connection)
         .await?;
-    Ok(())
+    let result = async {
+        sqlx::query("CREATE TABLE IF NOT EXISTS classes(id TEXT PRIMARY KEY,name TEXT NOT NULL,teacher_key_hash TEXT NOT NULL,retention_days INTEGER NOT NULL,created_at INTEGER NOT NULL)").execute(&mut *connection).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS roster(id TEXT PRIMARY KEY,class_id TEXT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,alias TEXT NOT NULL,token_hash TEXT NOT NULL,created_at INTEGER NOT NULL,UNIQUE(class_id,token_hash))").execute(&mut *connection).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,class_id TEXT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,seed TEXT NOT NULL,started_at INTEGER NOT NULL,late_at INTEGER NOT NULL,ends_at INTEGER NOT NULL,closed_at INTEGER)").execute(&mut *connection).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS checkins(session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,roster_id TEXT NOT NULL REFERENCES roster(id) ON DELETE CASCADE,status TEXT NOT NULL,checked_at INTEGER NOT NULL,source TEXT NOT NULL,PRIMARY KEY(session_id,roster_id))").execute(&mut *connection).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(ends_at,closed_at)")
+            .execute(&mut *connection)
+            .await?;
+        sqlx::query("DELETE FROM classes WHERE created_at + retention_days * 86400 < ?")
+            .bind(Utc::now().timestamp())
+            .execute(&mut *connection)
+            .await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            sqlx::query("COMMIT").execute(&mut *connection).await?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+            Err(error)
+        }
+    }
 }
 
 async fn spa_page(State(state): State<AppState>) -> Response {
@@ -1204,12 +1233,15 @@ async fn main() {
             let _ = std::fs::create_dir_all(path);
         }
     }
+    let connect_options = SqliteConnectOptions::from_str(&database_url)
+        .expect("parse sqlite database location")
+        .busy_timeout(Duration::from_secs(120));
     let pool = SqlitePoolOptions::new()
         // SQLite is intentionally the persistence boundary for this small,
         // single-replica product. One connection prevents an Azure Files mount
         // from seeing competing SQLite file locks during startup or writes.
         .max_connections(1)
-        .connect(&database_url)
+        .connect_with(connect_options)
         .await
         .expect("connect sqlite");
     migrate(&pool).await.expect("migrate database");
@@ -1914,6 +1946,48 @@ mod tests {
             .unwrap();
         assert_eq!(read.status(), StatusCode::OK);
         pool.close().await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_migration_waits_for_a_rolling_replica_lock() {
+        let root = std::env::temp_dir().join(format!("pcc-rolling-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let database_url = format!("sqlite://{}?mode=rwc", root.join("checkin.db").display());
+        let options = SqliteConnectOptions::from_str(&database_url)
+            .unwrap()
+            .busy_timeout(Duration::from_secs(2));
+        let first = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .unwrap();
+        let second = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+
+        let mut lock = first.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let migrating = tokio::spawn(async move { migrate(&second).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!migrating.is_finished());
+        sqlx::query("COMMIT").execute(&mut *lock).await.unwrap();
+        drop(lock);
+        migrating.await.unwrap().unwrap();
+
+        let table_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('classes','roster','sessions','checkins')",
+        )
+        .fetch_one(&first)
+        .await
+        .unwrap();
+        assert_eq!(table_count, 4);
+        first.close().await;
         fs::remove_dir_all(root).unwrap();
     }
 }
