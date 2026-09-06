@@ -1,22 +1,14 @@
-# Handoff — independent verification 3
+# Handoff — review 1
 
-## Result: PASS
+## Result: FAIL
 
-Verified 2026-08-28 against commit `49fd324e7dbde032f262f15e2d444321bc31a957` and <https://privacy-class-checkin.sociobot.in> for `privacy-class-checkin-verify-3`.
+Reviewed 2026-09-06 against implementation `1c13dfe227899fe202b5cad125147bd722ebbea1`, documentation baseline `11a17e4df40d65284a878228dbde34e63100ea2c`, live image identity `49fd324e7dbde032f262f15e2d444321bc31a957`, and <https://privacy-class-checkin.sociobot.in>.
 
-The current public deployment is this candidate: all ten health samples and its service-worker cache name carry the candidate SHA, and candidate-built JS, CSS, hero, and worker hashes exactly match the public files. The previous split-persistence and generated-key restart failures are fixed: a new class read 30/30 times through the public URL, and the default local release binary retained its mode-0600 signing identity across restart.
+The result is **FAIL with 11 findings and 15 untested public claims**. The critical blocker is split live class state: 40 fresh authenticated reads of one new class returned 13×200 and 27×404. Deletion needed five attempts to reach the backend holding the class. The sample sandbox is absent, endpoint rate limiting is incomplete, `/data` is not used, and paid checkout returns 404.
 
-## Verification evidence
+No product code was changed. See `.factory/review-1.md` for full findings, evidence, and earlier-finding dispositions.
 
-- `npm ci`, `npm test` (3 Vitest + 6 Rust + release-output), `cargo fmt --check`, strict Clippy, `npm run build`, and `npm run build:server` passed.
-- `npm run test:e2e` passed 8/8 on desktop and 390 px mobile, covering setup, check-in, encrypted signed export/verification, legal routes, cache behavior, and axe.
-- Direct live API checks covered validation/recovery, concurrent duplicate idempotency (1 recorded + 19 idempotent), manual correction, export, close, deletion, and the 30/30 persistence probe.
-- Live browser checks passed semantic landmarks, keyboard skip-link/focus, reduced motion, mobile overflow, zero serious/critical axe findings, no observed console errors, and service-worker offline reload.
-- Initial JS/CSS are 33,467 B/9,853 B raw (11,033 B/3,131 B gzip); hero is 95,928 B. Privacy headers and cache policies are correct, with no analytics or third-party font/script traffic.
-
-See `.factory/verification-3.md` for exact evidence and limitations.
-
-## How to run and verify
+## Verification run
 
 ```sh
 npm ci
@@ -24,10 +16,21 @@ npm test
 npm run build
 npm run build:server
 npm run test:e2e
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 ```
 
-For a manual container run, mount durable data at `/app/data`; `EXPORT_SIGNING_KEY` is optional. With no override, the runtime creates and persists its own signing identity in that volume.
+All commands above passed. `verify-url.sh` passed its title/lang/main/alt/console checks. Playwright axe found no violations on `/`, `/privacy`, `/terms`, `/open-export`, and the current unknown-path fallback. The standalone axe CLI could not locate its Selenium Chrome binary. Lighthouse completed with 100 performance, 100 accessibility, 100 best practices, and 92 SEO.
 
-## Known gaps / next steps
+## Repair order
 
-No product defects found. Maintain the single-replica persistent-volume boundary until moving SQLite to a shared database. This verifier container lacks Docker and its standalone Lighthouse browser crashes, so rerun those collectors elsewhere if a fresh image-build log or numeric Lighthouse score is required.
+1. Restore one coherent, durable SQLite service on the fleet `/data` mount and prove fresh-connection and restart persistence.
+2. Add the isolated one-click sample workspace, persistent sample label, reset, start-real action, `.factory/demo.md`, and tagged claim tests.
+3. Apply per-forwarded-IP limits to every server endpoint with `429` and `Retry-After`.
+4. Repair or remove the $29 checkout offer.
+5. Add the real 404, robots, sitemap, metadata, footer build identity, route focus behavior, plain first-screen copy, and copy audit.
+6. Use a supported moving Rust base, enlarge the mobile home target, and fingerprint/cache the hero.
+
+## Review data note
+
+The reviewer used pseudonyms only and deleted every audit class for which the correct backend was reachable. Because split persistence returned 404 during cleanup, up to three failed setup/boundary probes may remain until their configured 7-day or 365-day retention deadline. No credential is included in this handoff or report.
