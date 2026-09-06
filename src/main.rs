@@ -201,7 +201,14 @@ fn read_or_create_signing_secret(path: &FsPath) -> io::Result<(String, bool)> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+                    // Azure Files controls mount permissions and rejects chmod.
+                    // The share is private to this product; other I/O failures
+                    // must still stop startup.
+                    if error.kind() != io::ErrorKind::PermissionDenied {
+                        return Err(error);
+                    }
+                }
             }
             file.write_all(generated.as_bytes())?;
             file.write_all(b"\n")?;
