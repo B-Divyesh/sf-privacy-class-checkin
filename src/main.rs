@@ -169,6 +169,10 @@ fn recover_empty_bootstrap(database_url: &str) -> io::Result<bool> {
     if fs::metadata(&database).is_ok_and(|metadata| metadata.len() == 0) && journal.exists() {
         fs::remove_file(&journal)?;
         fs::remove_file(&database)?;
+        let dot_lock = PathBuf::from(format!("{}.lock", database.display()));
+        if dot_lock.is_dir() {
+            fs::remove_dir(&dot_lock)?;
+        }
         return Ok(true);
     }
     Ok(false)
@@ -1297,9 +1301,15 @@ async fn main() {
     if recover_empty_bootstrap(&database_url).expect("recover an empty sqlite bootstrap") {
         tracing::warn!("removed an incomplete empty sqlite bootstrap");
     }
-    let connect_options = SqliteConnectOptions::from_str(&database_url)
+    let mut connect_options = SqliteConnectOptions::from_str(&database_url)
         .expect("parse sqlite database location")
         .busy_timeout(Duration::from_secs(120));
+    if database_file_path(&database_url).is_some_and(|path| path.starts_with("/data")) {
+        // Azure Files does not provide the byte-range lock behavior used by
+        // SQLite's default Unix VFS. Dot-file locking uses atomic directory
+        // operations supported by the mounted share.
+        connect_options = connect_options.vfs("unix-dotfile");
+    }
     let pool = SqlitePoolOptions::new()
         // SQLite is intentionally the persistence boundary for this small,
         // single-replica product. One connection prevents an Azure Files mount
@@ -2062,14 +2072,17 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let database = root.join("checkin.db");
         let journal = root.join("checkin.db-journal");
+        let dot_lock = root.join("checkin.db.lock");
         let database_url = format!("sqlite://{}?mode=rwc", database.display());
         fs::write(&database, []).unwrap();
         fs::write(&journal, b"incomplete bootstrap").unwrap();
+        fs::create_dir(&dot_lock).unwrap();
 
         let first = acquire_startup_guard(&database_url).await.unwrap();
         assert!(recover_empty_bootstrap(&database_url).unwrap());
         assert!(!database.exists());
         assert!(!journal.exists());
+        assert!(!dot_lock.exists());
         let waiting_url = database_url.clone();
         let waiting = tokio::spawn(async move { acquire_startup_guard(&waiting_url).await });
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2083,10 +2096,22 @@ mod tests {
         drop(second);
         assert!(!root.join("checkin.startup-lock").exists());
 
-        fs::write(&database, b"real data").unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str(&database_url)
+                    .unwrap()
+                    .vfs("unix-dotfile"),
+            )
+            .await
+            .unwrap();
+        migrate(&pool).await.unwrap();
+        pool.close().await;
+        let database_bytes = fs::read(&database).unwrap();
+        assert!(!database_bytes.is_empty());
         fs::write(&journal, b"journal").unwrap();
         assert!(!recover_empty_bootstrap(&database_url).unwrap());
-        assert_eq!(fs::read(&database).unwrap(), b"real data");
+        assert_eq!(fs::read(&database).unwrap(), database_bytes);
         fs::remove_dir_all(root).unwrap();
     }
 }
