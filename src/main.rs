@@ -185,6 +185,11 @@ fn read_or_create_signing_secret(path: &FsPath) -> io::Result<(String, bool)> {
         if !existing.trim().is_empty() {
             return Ok((existing.trim().to_owned(), false));
         }
+        // Runtime startup holds the cross-replica startup guard while calling
+        // this function, so an empty file is an interrupted bootstrap rather
+        // than an in-progress write from another process.
+        drop(file);
+        fs::remove_file(path)?;
     }
 
     if let Some(parent) = path.parent() {
@@ -1319,9 +1324,9 @@ async fn main() {
         .await
         .expect("connect sqlite");
     migrate(&pool).await.expect("migrate database");
-    drop(startup_guard);
     let (signing_secret, signing_key_source) =
         load_signing_secret(&database_url).expect("load or create persisted export signing key");
+    drop(startup_guard);
     tracing::info!(
         database_source,
         signing_key_source,
@@ -1397,6 +1402,8 @@ mod tests {
     fn generated_signing_key_persists_beside_sqlite_database() {
         let root = std::env::temp_dir().join(format!("pcc-signing-key-{}", Uuid::new_v4()));
         let database_url = format!("sqlite://{}?mode=rwc", root.join("checkin.db").display());
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("checkin.export-signing-key"), []).unwrap();
         let (first, first_source) = load_signing_secret(&database_url).unwrap();
         let (second, second_source) = load_signing_secret(&database_url).unwrap();
         assert_eq!(first_source, "generated");
