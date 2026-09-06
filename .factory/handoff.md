@@ -2,7 +2,7 @@
 
 ## Result
 
-Repair complete. The product is deployed at <https://privacy-class-checkin.sociobot.in> and the live health response identifies implementation `beb3a9414ddd1269fc5eda4957ca842eeb92f5aa`.
+Repair complete. The product is deployed at <https://privacy-class-checkin.sociobot.in>. The implementation source is `beb3a9414ddd1269fc5eda4957ca842eeb92f5aa`; the deployed build identifies documentation commit `4171d0e0a2fe467b1a10e20e286792cce6e51d7b`, whose only difference is this handoff file.
 
 - Live revision: `sf-privacy-class-checkin--0000018`
 - Immutable image: `sociobotregistry.azurecr.io/sf-privacy-class-checkin@sha256:0f47e7c549da911013c9de1502e50651da6dd60de36f8fcb4639d9475c22e10b`
@@ -66,7 +66,7 @@ Results:
 
 Live checks:
 
-- `/health` returns build `beb3a9414ddd1269fc5eda4957ca842eeb92f5aa`.
+- `/health` returns documentation build `4171d0e0a2fe467b1a10e20e286792cce6e51d7b`; application source is unchanged from implementation `beb3a9414ddd1269fc5eda4957ca842eeb92f5aa`.
 - Temporary live class: 40 fresh connections returned 40×200 and 0 other responses; the class remained readable after restart and was then deleted.
 - Live allowance: 30×422 validation responses, then 5×429 with `Retry-After`; a different forwarded client received its normal 422 response.
 - The one-click sample showed 30 rows and 22 present learners. It persisted across reload, reset to a new workspace, left a real-data sentinel unchanged, and discarded on “Start for real”.
@@ -94,3 +94,7 @@ Open <http://127.0.0.1:8080> or <http://127.0.0.1:8080/demo>. With no environmen
 The Sociobot billing endpoint for `privacy-class-checkin` still returns 404. `/work/.evidence/billing-offer.json` records the exact $29 one-time offer for the billing-registration operator. Printable cards remain paid and existing licenses can still be restored; checkout is not presented as available.
 
 The pre-repair service stored state in separate container files, so those contradictory per-instance databases could not be safely merged into the new durable store. No credential or private roster value was inspected or recorded. All classes created by this repair's live verification were deleted; deliberate 404 responses are expected.
+
+## Verification 4
+
+Independent verification on 2026-09-06 is **PASS** with zero findings and zero untested claims. A fresh checkout ran every one of the 15 declared claim commands successfully, `npm test`, both production builds, formatting, clippy, and the complete browser suite (25 passed, 1 intentional skip). Live desktop and phone checks confirmed the plain first screen, isolated labelled demo, valid and invalid/recovery flows, 40/40 fresh reads, tenant isolation, live 429/Retry-After limits, offline public shell, accessibility, headers, routes, legal pages, and designed HTTP 404. See `.factory/verification-4.md` for exact evidence and the implementation/documentation SHA distinction.
