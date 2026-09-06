@@ -1,57 +1,90 @@
 # Privacy Class Check-in
 
-A deliberately minimal classroom attendance signal for teachers who do not want biometrics, location tracking, student accounts, or a surveillance product. Teachers issue pseudonymous one-time roster tokens, show a rotating session code, make accessible manual corrections, and download a signed CSV encrypted locally in the browser.
+Privacy Class Check-in helps a teacher record attendance with rotating codes and pseudonymous roster tokens. It does not ask learners for names, accounts, location, biometrics, camera access, or microphone access.
 
-It is intended for small classes. A check-in shows that someone had a current code and valid token; it is **not proof of identity or physical presence**.
+A check-in shows that someone used a current code and valid token. It does not prove identity or physical presence.
 
-## What is included
+Try the isolated sample at <https://privacy-class-checkin.sociobot.in/demo>. It opens a filled 30-learner class without writing to the real SQLite database.
 
-- Rust/axum service and SQLite persistence, with token/key hashing and automatic retention cleanup
-- Fast Vite + TypeScript frontend for learner and teacher flows
-- 90-second rotating session codes and explicit present/late/absent status
-- Manual keyboard-friendly fallback and Ed25519-signed CSV exports
-- Browser-side AES-256-GCM export encryption (PBKDF2-SHA256, 210,000 rounds), plus a local-only decrypt-and-verify tool
-- Optional $29 one-time Sociobot license for printable token cards; all core and accessibility features are free
-- Offline shell notice, privacy and terms pages, responsive 390 px layout
+## What teachers can do
 
-## Develop
+- Create a class with 1–60 pseudonyms and choose a retention period.
+- Issue one-time readable roster tokens and save a private recovery link.
+- Start a session with a rotating six-digit code.
+- Make keyboard-accessible present, late, or absent corrections.
+- Download an Ed25519-signed CSV encrypted in the browser.
+- Delete a class and its related records immediately.
 
-Requirements: Node 22+, Rust 1.88+, and SQLite runtime support.
+The free core includes check-in, correction, export, deletion, and accessibility features. A $29 one-time license adds printable token cards. Billing registration is pending, so checkout is not currently available. Existing license holders can restore a token in the app.
+
+## Run locally
+
+Requirements: Node 22 or later, the current stable Rust toolchain, and SQLite runtime support.
 
 ```sh
 npm ci
 npm run build
-DATABASE_URL='sqlite://data/checkin.db?mode=rwc' cargo run
+cargo run
 ```
 
-Open `http://localhost:8080`. For frontend hot reload, run `npm run dev` in a second terminal; Vite proxies `/api` to port 8080.
+Open <http://localhost:8080>. The server starts with no required environment variables. It uses `/data/checkin.db` when `/data` exists. Otherwise, it creates a `data` directory beside the server binary.
 
-Configuration is environment-only:
+For frontend hot reload, run `npm run dev` in another terminal. Vite proxies `/api` and `/health` to port 8080.
 
-- `PORT` — HTTP port, default `8080`
-- `DATABASE_URL` — SQLite URL, default `sqlite://data/checkin.db?mode=rwc`
-- `EXPORT_SIGNING_KEY` — optional stable private input used to derive the Ed25519 export key. If unset, the service generates a CSPRNG value once beside the SQLite file (mode `0600`) and reuses it after restart.
-- `BUILD_SHA` — returned by `/health`
-- `DIST_DIR` — built frontend location, default `dist`
+Optional configuration:
+
+- `PORT` — HTTP port; default `8080`.
+- `DATABASE_URL` — overrides the SQLite file URL.
+- `EXPORT_SIGNING_KEY` — overrides the generated, persisted export-signing secret.
+- `BUILD_SHA` — release identity returned by `/health`.
+- `DIST_DIR` — built frontend directory; default `dist`.
 
 ## Test and build
 
+From a clean checkout:
+
 ```sh
-npm test             # frontend unit + Rust unit/integration tests
-npm run build        # reproducible frontend output in dist/
-npm run test:e2e     # Chromium desktop + mobile flow
-docker build --build-arg BUILD_SHA="$(git rev-parse HEAD)" -t privacy-class-checkin .
-docker run --rm -p 8080:8080 -v checkin-data:/app/data privacy-class-checkin
+npm ci
+npm test
+npm run build
+npm run build:server
+npm run test:e2e
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 ```
 
-The container runs as UID 10001, exposes port 8080, serves frontend and API from one origin, and stores SQLite data under `/app/data`.
+Public claims and their exact commands are listed in [`.factory/claims.json`](.factory/claims.json). Run the complete browser claim suite with:
 
-## Privacy and security notes
+```sh
+npm run test:claims
+```
 
-No analytics, third-party scripts, remote fonts, location, biometrics, or device fingerprints are used. Roster tokens and teacher keys are stored only as SHA-256 hashes server-side; readable copies exist only in the teacher's browser. Check-in attempts are bounded, request bodies are limited, and same-origin security headers deny camera, microphone, geolocation, framing, and foreign scripts. See `/privacy` and `/terms` in the app for the user-facing policies.
+The backend claim checks are included in `npm test`. The browser suite covers desktop Chromium, a 390×844 phone viewport, the demo, legal routes, keyboard use, offline reload, exports, and automated accessibility checks.
+
+For a 100-request local allowance smoke test:
+
+```sh
+seq 1 100 | xargs -P20 -I{} curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H 'content-type: application/json' -H 'x-forwarded-for: 198.51.100.20' \
+  -d '{}' http://127.0.0.1:8080/api/classes
+```
+
+The result includes `429` responses with `Retry-After`. A different forwarded client address retains its own allowance.
+
+## Privacy and storage
+
+Teacher keys and roster tokens are stored as SHA-256 hashes. Readable copies are returned only during setup and remain in the teacher's browser if saved there. The server stores the class label, pseudonyms, session times, attendance marks, and correction source.
+
+The browser encrypts the default export with AES-256-GCM. It derives the key with PBKDF2-SHA256 and 210,000 rounds. The export and passphrase stay in the browser. Public pages work after a service-worker warm-up; live API actions require a connection.
+
+See `/privacy` and `/terms` for the user-facing policies. There are no analytics, third-party scripts, or remote fonts.
 
 ## Deploy
 
-The factory deploys the root `Dockerfile`. This SQLite product must run as **one stateful replica** with a persistent `/app/data` volume; do not horizontally scale it without moving persistence to a shared database. The service generates and persists its own export-signing key in that volume when no `EXPORT_SIGNING_KEY` override is supplied. Pass the immutable commit as Docker build argument `BUILD_SHA`; it is returned by `/health` and versions the offline shell cache. Hashed `/assets/*` responses are immutable for one year, while HTML, the manifest, and `/sw.js` revalidate on each request. Do not place a CDN in front of `/api` that caches responses. The canonical URL is <https://privacy-class-checkin.sociobot.in>.
+The factory builds the root `Dockerfile`. The image runs as UID 10001 on `PORT`, defaults to `/data/checkin.db`, and persists its generated signing key beside that database. Deploy exactly one replica with the fleet-managed `/data` volume. Do not use ephemeral multi-replica storage for SQLite.
+
+Pass the source commit as `BUILD_SHA`. `/health` returns that identity. Fingerprinted assets use a one-year immutable cache; pages, the manifest, and the service worker revalidate.
+
+The canonical production URL is <https://privacy-class-checkin.sociobot.in>.
 
 MIT licensed. See [LICENSE](LICENSE).

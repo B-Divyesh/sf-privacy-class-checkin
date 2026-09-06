@@ -16,7 +16,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::{
-    collections::VecDeque,
+    collections::HashMap,
     env,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
@@ -39,7 +39,32 @@ struct AppState {
     pool: SqlitePool,
     signing_key: Arc<SigningKey>,
     build_sha: String,
-    checkin_attempts: Arc<Mutex<VecDeque<Instant>>>,
+    rate_limits: Arc<Mutex<HashMap<String, RateWindow>>>,
+    demos: Arc<Mutex<HashMap<String, DemoWorkspace>>>,
+    dist: Arc<PathBuf>,
+}
+
+#[derive(Clone)]
+struct DemoRosterEntry {
+    id: String,
+    alias: String,
+    status: String,
+    checked_at: Option<i64>,
+    source: Option<String>,
+}
+
+#[derive(Clone)]
+struct DemoWorkspace {
+    created_at: Instant,
+    created_unix: i64,
+    seed: String,
+    learner_token: String,
+    roster: Vec<DemoRosterEntry>,
+}
+
+struct RateWindow {
+    started_at: Instant,
+    count: u32,
 }
 
 #[derive(Debug)]
@@ -197,8 +222,72 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
         HeaderName::from_static("permissions-policy"),
         HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
     );
-    headers.insert(HeaderName::from_static("content-security-policy"), HeaderValue::from_static("default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' https://api.sociobot.in https://pilot-api.sociobot.in; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"));
+    headers.insert(HeaderName::from_static("content-security-policy"), HeaderValue::from_static("default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self' https://api.sociobot.in https://pilot-api.sociobot.in; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"));
     response
+}
+
+async fn rate_limit(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
+    if request.uri().path() == "/health" {
+        return next.run(request).await;
+    }
+    let forwarded = request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("local");
+    let is_api = request.uri().path().starts_with("/api/");
+    let is_write =
+        request.method() != axum::http::Method::GET && request.method() != axum::http::Method::HEAD;
+    let (bucket, allowance, window) = if is_api && is_write {
+        ("api-write", 30, Duration::from_secs(10))
+    } else if is_api {
+        ("api-read", 80, Duration::from_secs(10))
+    } else {
+        ("page", 180, Duration::from_secs(10))
+    };
+    let key = format!("{forwarded}:{bucket}");
+    let retry_after = {
+        let mut limits = match state.rate_limits.lock() {
+            Ok(limits) => limits,
+            Err(_) => return internal("rate limiter lock").into_response(),
+        };
+        limits.retain(|_, item| item.started_at.elapsed() < Duration::from_secs(60));
+        let item = limits.entry(key).or_insert(RateWindow {
+            started_at: Instant::now(),
+            count: 0,
+        });
+        if item.started_at.elapsed() >= window {
+            item.started_at = Instant::now();
+            item.count = 0;
+        }
+        if item.count >= allowance {
+            Some(
+                window
+                    .saturating_sub(item.started_at.elapsed())
+                    .as_secs()
+                    .max(1),
+            )
+        } else {
+            item.count += 1;
+            None
+        }
+    };
+    if let Some(seconds) = retry_after {
+        let mut response = ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests from this connection. Wait a few seconds and try again.".into(),
+        )
+        .into_response();
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_str(&seconds.to_string()).unwrap_or(HeaderValue::from_static("1")),
+        );
+        return response;
+    }
+    next.run(request).await
 }
 
 fn is_hashed_asset(path: &str) -> bool {
@@ -460,23 +549,6 @@ async fn checkin(
     State(state): State<AppState>,
     Json(input): Json<Checkin>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    {
-        let mut attempts = state
-            .checkin_attempts
-            .lock()
-            .map_err(|_| internal("rate limiter lock"))?;
-        let cutoff = Instant::now() - Duration::from_secs(10);
-        while attempts.front().is_some_and(|at| *at < cutoff) {
-            attempts.pop_front();
-        }
-        if attempts.len() >= 100 {
-            return Err(ApiError(
-                StatusCode::TOO_MANY_REQUESTS,
-                "Too many check-in attempts. Wait a few seconds and try again.".into(),
-            ));
-        }
-        attempts.push_back(Instant::now());
-    }
     let code: String = input.code.chars().filter(|c| c.is_ascii_digit()).collect();
     if code.len() != 6 || input.token.trim().len() < 6 {
         return Err(bad(
@@ -670,6 +742,284 @@ async fn delete_class(
     Ok(Json(json!({"deleted":true})))
 }
 
+fn demo_view(id: &str, demo: &DemoWorkspace) -> serde_json::Value {
+    let now = Utc::now().timestamp();
+    let current_code = session_code(&demo.seed, now / 90);
+    json!({
+        "workspaceId": id,
+        "expiresIn": 86_400_i64.saturating_sub(demo.created_at.elapsed().as_secs() as i64),
+        "sampleToken": demo.learner_token,
+        "class": {
+            "id": format!("demo-{id}"),
+            "name": "Tuesday science lab",
+            "retentionDays": 7,
+            "roster": demo.roster.iter().map(|entry| json!({"id":entry.id,"alias":entry.alias})).collect::<Vec<_>>(),
+            "sessions": [{"id":"sample-session","startedAt":demo.created_unix,"endsAt":demo.created_unix + 3600,"closedAt":null}]
+        },
+        "session": {
+            "id": "sample-session",
+            "code": current_code,
+            "codeExpiresIn": 90 - (now % 90),
+            "startedAt": demo.created_unix,
+            "lateAt": demo.created_unix + 600,
+            "endsAt": demo.created_unix + 3600,
+            "closedAt": null,
+            "active": true,
+            "roster": demo.roster.iter().map(|entry| json!({
+                "id":entry.id,
+                "alias":entry.alias,
+                "status":entry.status,
+                "checkedAt":entry.checked_at,
+                "source":entry.source
+            })).collect::<Vec<_>>()
+        }
+    })
+}
+
+fn purge_expired_demos(demos: &mut HashMap<String, DemoWorkspace>) {
+    demos.retain(|_, demo| demo.created_at.elapsed() < Duration::from_secs(86_400));
+}
+
+async fn create_demo(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
+    let aliases = [
+        "Aster 01",
+        "Birch 02",
+        "Cedar 03",
+        "Clover 04",
+        "Fern 05",
+        "Hazel 06",
+        "Iris 07",
+        "Juniper 08",
+        "Linden 09",
+        "Maple 10",
+        "Moss 11",
+        "Oak 12",
+        "Pine 13",
+        "Reed 14",
+        "Sage 15",
+        "Sorrel 16",
+        "Spruce 17",
+        "Thyme 18",
+        "Violet 19",
+        "Willow 20",
+        "Yarrow 21",
+        "Alder 22",
+        "Beech 23",
+        "Elm 24",
+        "Laurel 25",
+        "Rowan 26",
+        "Bramble 27",
+        "Heather 28",
+        "Larch 29",
+        "Rush 30",
+    ];
+    let created_unix = Utc::now().timestamp();
+    let roster = aliases
+        .iter()
+        .enumerate()
+        .map(|(index, alias)| {
+            let (status, checked_at, source) = if index < 22 {
+                (
+                    "present",
+                    Some(created_unix + 60 + index as i64 * 4),
+                    Some("student"),
+                )
+            } else if index < 25 {
+                (
+                    "late",
+                    Some(created_unix + 720 + index as i64 * 3),
+                    Some("student"),
+                )
+            } else {
+                ("absent", None, None)
+            };
+            DemoRosterEntry {
+                id: format!("sample-roster-{}", index + 1),
+                alias: (*alias).to_owned(),
+                status: status.to_owned(),
+                checked_at,
+                source: source.map(str::to_owned),
+            }
+        })
+        .collect();
+    let id = random_secret(18);
+    let demo = DemoWorkspace {
+        created_at: Instant::now(),
+        created_unix,
+        seed: random_secret(20),
+        learner_token: token(),
+        roster,
+    };
+    let body = demo_view(&id, &demo);
+    let mut demos = state.demos.lock().map_err(|_| internal("demo lock"))?;
+    purge_expired_demos(&mut demos);
+    demos.insert(id, demo);
+    Ok((StatusCode::CREATED, Json(body)))
+}
+
+async fn get_demo(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let mut demos = state.demos.lock().map_err(|_| internal("demo lock"))?;
+    purge_expired_demos(&mut demos);
+    let demo = demos.get(&id).ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            "This sample has expired. Reset the demo to start again.".into(),
+        )
+    })?;
+    Ok(Json(demo_view(&id, demo)))
+}
+
+async fn delete_demo(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let mut demos = state.demos.lock().map_err(|_| internal("demo lock"))?;
+    demos.remove(&id);
+    Ok(Json(json!({"deleted":true})))
+}
+
+async fn demo_checkin(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Json(input): Json<Checkin>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let now = Utc::now().timestamp();
+    let code: String = input
+        .code
+        .chars()
+        .filter(|character| character.is_ascii_digit())
+        .collect();
+    let mut demos = state.demos.lock().map_err(|_| internal("demo lock"))?;
+    purge_expired_demos(&mut demos);
+    let demo = demos.get_mut(&id).ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            "This sample has expired. Reset the demo to start again.".into(),
+        )
+    })?;
+    let code_matches = secure_eq(&code, &session_code(&demo.seed, now / 90))
+        || secure_eq(&code, &session_code(&demo.seed, now / 90 - 1));
+    if !code_matches {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "That sample code is no longer current. Refresh the sample and try again.".into(),
+        ));
+    }
+    if !secure_eq(
+        &input.token.trim().to_ascii_lowercase(),
+        &demo.learner_token.to_ascii_lowercase(),
+    ) {
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "That sample token does not match. Use the token shown in the demo.".into(),
+        ));
+    }
+    let entry = demo
+        .roster
+        .last_mut()
+        .ok_or_else(|| internal("sample roster is empty"))?;
+    let recorded = entry.status == "absent";
+    if recorded {
+        entry.status = "present".into();
+        entry.checked_at = Some(now);
+        entry.source = Some("student".into());
+    }
+    Ok(Json(
+        json!({"alias":entry.alias,"status":entry.status,"recorded":recorded}),
+    ))
+}
+
+async fn update_demo_status(
+    Path((id, roster_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(input): Json<StatusUpdate>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !["present", "late", "absent"].contains(&input.status.as_str()) {
+        return Err(bad("Status must be present, late, or absent."));
+    }
+    let mut demos = state.demos.lock().map_err(|_| internal("demo lock"))?;
+    purge_expired_demos(&mut demos);
+    let demo = demos.get_mut(&id).ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            "This sample has expired. Reset the demo to start again.".into(),
+        )
+    })?;
+    let entry = demo
+        .roster
+        .iter_mut()
+        .find(|entry| entry.id == roster_id)
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                "Sample roster entry not found.".into(),
+            )
+        })?;
+    entry.status = input.status;
+    entry.checked_at = (entry.status != "absent").then(|| Utc::now().timestamp());
+    entry.source = (entry.status != "absent").then(|| "manual".to_owned());
+    Ok(Json(json!({"ok":true})))
+}
+
+async fn demo_export(Path(id): Path<String>, State(state): State<AppState>) -> ApiResult<Response> {
+    let demos = state.demos.lock().map_err(|_| internal("demo lock"))?;
+    let demo = demos
+        .get(&id)
+        .filter(|demo| demo.created_at.elapsed() < Duration::from_secs(86_400))
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                "This sample has expired. Reset the demo to start again.".into(),
+            )
+        })?;
+    let mut data = String::from("pseudonym,status,recorded_at_utc,source\r\n");
+    for entry in &demo.roster {
+        let timestamp = entry
+            .checked_at
+            .and_then(|value| chrono::DateTime::from_timestamp(value, 0))
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_default();
+        data.push_str(&format!(
+            "{},{},{},{}\r\n",
+            csv_cell(&entry.alias),
+            entry.status,
+            timestamp,
+            entry.source.as_deref().unwrap_or("automatic")
+        ));
+    }
+    let signature = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        state.signing_key.sign(data.as_bytes()).to_bytes(),
+    );
+    let public_key = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        state.signing_key.verifying_key().to_bytes(),
+    );
+    let body = format!(
+        "# Privacy Class Check-in signed sample export\r\n# class={}\r\n# session_started={}\r\n# generated={}\r\n# signature=ed25519:{}\r\n# public_key=ed25519:{}\r\n{}",
+        csv_cell("Tuesday science lab"),
+        demo.created_unix,
+        Utc::now().to_rfc3339(),
+        signature,
+        public_key,
+        data
+    );
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=sample-attendance.csv",
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({"status":"ok","buildSha":state.build_sha}))
 }
@@ -690,36 +1040,99 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-fn app(state: AppState, dist: PathBuf) -> Router {
-    let api = Router::new()
-        .route("/health", get(health))
-        .route("/api/classes", post(create_class))
-        .route(
-            "/api/classes/{class_id}",
-            get(get_class).delete(delete_class),
+async fn spa_page(State(state): State<AppState>) -> Response {
+    match tokio::fs::read(state.dist.join("index.html")).await {
+        Ok(body) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            body,
         )
-        .route("/api/classes/{class_id}/sessions", post(start_session))
+            .into_response(),
+        Err(error) => internal(error).into_response(),
+    }
+}
+
+async fn not_found(State(state): State<AppState>) -> Response {
+    match tokio::fs::read(state.dist.join("404.html")).await {
+        Ok(body) => (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            body,
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "Page not found. Return to the home page.",
+        )
+            .into_response(),
+    }
+}
+
+async fn api_not_found() -> ApiError {
+    ApiError(StatusCode::NOT_FOUND, "API endpoint not found.".into())
+}
+
+fn app(mut state: AppState, dist: PathBuf) -> Router {
+    state.dist = Arc::new(dist.clone());
+    let api = Router::new()
+        .route("/classes", post(create_class))
+        .route("/classes/{class_id}", get(get_class).delete(delete_class))
+        .route("/classes/{class_id}/sessions", post(start_session))
         .route(
-            "/api/classes/{class_id}/sessions/{session_id}",
+            "/classes/{class_id}/sessions/{session_id}",
             get(session_detail),
         )
         .route(
-            "/api/classes/{class_id}/sessions/{session_id}/close",
+            "/classes/{class_id}/sessions/{session_id}/close",
             post(close_session),
         )
         .route(
-            "/api/classes/{class_id}/sessions/{session_id}/roster/{roster_id}",
+            "/classes/{class_id}/sessions/{session_id}/roster/{roster_id}",
             put(update_status),
         )
         .route(
-            "/api/classes/{class_id}/sessions/{session_id}/export",
+            "/classes/{class_id}/sessions/{session_id}/export",
             get(export_csv),
         )
-        .route("/api/checkins", post(checkin))
+        .route("/checkins", post(checkin))
+        .route("/demo", post(create_demo))
+        .route("/demo/{id}", get(get_demo).delete(delete_demo))
+        .route("/demo/{id}/checkins", post(demo_checkin))
+        .route("/demo/{id}/roster/{roster_id}", put(update_demo_status))
+        .route("/demo/{id}/export", get(demo_export))
+        .fallback(api_not_found)
         .layer(DefaultBodyLimit::max(64 * 1024));
+    let pages = Router::new()
+        .route("/", get(spa_page))
+        .route("/demo", get(spa_page))
+        .route("/privacy", get(spa_page))
+        .route("/terms", get(spa_page))
+        .route("/open-export", get(spa_page))
+        .route_service("/sw.js", ServeFile::new(dist.join("sw.js")))
+        .route_service(
+            "/manifest.webmanifest",
+            ServeFile::new(dist.join("manifest.webmanifest")),
+        )
+        .route_service("/favicon.svg", ServeFile::new(dist.join("favicon.svg")))
+        .route_service(
+            "/apple-touch-icon.png",
+            ServeFile::new(dist.join("apple-touch-icon.png")),
+        )
+        .route_service(
+            "/social-card.jpg",
+            ServeFile::new(dist.join("social-card.jpg")),
+        )
+        .route_service("/robots.txt", ServeFile::new(dist.join("robots.txt")))
+        .route_service("/sitemap.xml", ServeFile::new(dist.join("sitemap.xml")))
+        .route_service("/404.css", ServeFile::new(dist.join("404.css")))
+        .nest_service("/assets", ServeDir::new(dist.join("assets")))
+        .fallback(not_found);
     Router::new()
-        .merge(api)
-        .fallback_service(ServeDir::new(&dist).fallback(ServeFile::new(dist.join("index.html"))))
+        .route("/health", get(health))
+        .nest("/api", api)
+        .merge(pages)
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .layer(middleware::from_fn(cache_headers))
         .layer(middleware::from_fn(security_headers))
         .layer(TraceLayer::new_for_http())
@@ -744,6 +1157,34 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received");
 }
 
+fn database_config() -> io::Result<(String, &'static str)> {
+    if let Ok(value) = env::var("DATABASE_URL") {
+        if !value.trim().is_empty() {
+            return Ok((value, "supplied"));
+        }
+    }
+    let (directory, source) = if FsPath::new("/data").is_dir() {
+        (PathBuf::from("/data"), "durable /data")
+    } else {
+        let executable = env::current_exe()?;
+        let parent = executable.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "cannot locate executable directory",
+            )
+        })?;
+        (parent.join("data"), "local executable directory")
+    };
+    fs::create_dir_all(&directory)?;
+    Ok((
+        format!(
+            "sqlite://{}?mode=rwc",
+            directory.join("checkin.db").display()
+        ),
+        source,
+    ))
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -753,8 +1194,8 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    let database_url =
-        env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://data/checkin.db?mode=rwc".into());
+    let (database_url, database_source) =
+        database_config().expect("choose a writable SQLite database location");
     if let Some(file) = database_url
         .strip_prefix("sqlite://")
         .and_then(|v| v.split('?').next())
@@ -774,14 +1215,20 @@ async fn main() {
     migrate(&pool).await.expect("migrate database");
     let (signing_secret, signing_key_source) =
         load_signing_secret(&database_url).expect("load or create persisted export signing key");
-    tracing::info!(signing_key_source, "export signing key configured");
+    tracing::info!(
+        database_source,
+        signing_key_source,
+        "durable configuration ready"
+    );
     let signing_bytes: [u8; 32] = Sha256::digest(signing_secret.as_bytes()).into();
     let state = AppState {
         pool: pool.clone(),
         signing_key: Arc::new(SigningKey::from_bytes(&signing_bytes)),
         build_sha: env::var("BUILD_SHA")
             .unwrap_or_else(|_| option_env!("BUILD_SHA").unwrap_or("development").to_owned()),
-        checkin_attempts: Arc::new(Mutex::new(VecDeque::new())),
+        rate_limits: Arc::new(Mutex::new(HashMap::new())),
+        demos: Arc::new(Mutex::new(HashMap::new())),
+        dist: Arc::new(PathBuf::new()),
     };
     let cleanup_pool = pool.clone();
     tokio::spawn(async move {
@@ -889,7 +1336,9 @@ mod tests {
                 pool,
                 signing_key: Arc::new(SigningKey::from_bytes(&[9u8; 32])),
                 build_sha: "immutable-release-sha".into(),
-                checkin_attempts: Arc::new(Mutex::new(VecDeque::new())),
+                rate_limits: Arc::new(Mutex::new(HashMap::new())),
+                demos: Arc::new(Mutex::new(HashMap::new())),
+                dist: Arc::new(PathBuf::new()),
             },
             dist.clone(),
         );
@@ -931,7 +1380,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_class_session_checkin_export_and_delete_flow() {
+    #[doc = "@claim:rotating-code"]
+    async fn claim_rotating_code_and_closed_session_behavior() {
+        assert_ne!(session_code("seed", 10), session_code("seed", 11));
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -942,7 +1393,9 @@ mod tests {
             pool,
             signing_key: Arc::new(SigningKey::from_bytes(&[7u8; 32])),
             build_sha: "test".into(),
-            checkin_attempts: Arc::new(Mutex::new(VecDeque::new())),
+            rate_limits: Arc::new(Mutex::new(HashMap::new())),
+            demos: Arc::new(Mutex::new(HashMap::new())),
+            dist: Arc::new(PathBuf::new()),
         };
         let service = app(state, std::env::temp_dir());
         let create=service.clone().oneshot(Request::builder().method("POST").uri("/api/classes").header("content-type","application/json").body(Body::from(r#"{"className":"Botany 101","roster":["Fern 01","Moss 02"],"retentionDays":7}"#)).unwrap()).await.unwrap();
@@ -1055,6 +1508,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(close.status(), StatusCode::OK);
+        let stopped = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/checkins")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"code":code,"token":roster_token}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stopped.status(), StatusCode::NOT_FOUND);
         let delete = service
             .oneshot(
                 Request::builder()
@@ -1067,5 +1535,385 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(delete.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[doc = "@claim:one-way-credentials"]
+    async fn claim_one_way_credentials_are_not_stored_or_returned_readable() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        migrate(&pool).await.unwrap();
+        let service = app(
+            AppState {
+                pool: pool.clone(),
+                signing_key: Arc::new(SigningKey::from_bytes(&[3u8; 32])),
+                build_sha: "test".into(),
+                rate_limits: Arc::new(Mutex::new(HashMap::new())),
+                demos: Arc::new(Mutex::new(HashMap::new())),
+                dist: Arc::new(PathBuf::new()),
+            },
+            std::env::temp_dir(),
+        );
+        let create = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/classes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"className":"Private class","roster":["Fern 01"],"retentionDays":7}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let created = json_body(create).await;
+        let class_id = created["classId"].as_str().unwrap();
+        let teacher_key = created["teacherKey"].as_str().unwrap();
+        let roster_token = created["roster"][0]["token"].as_str().unwrap();
+        let stored_teacher: String =
+            sqlx::query_scalar("SELECT teacher_key_hash FROM classes WHERE id=?")
+                .bind(class_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let stored_token: String =
+            sqlx::query_scalar("SELECT token_hash FROM roster WHERE class_id=?")
+                .bind(class_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_teacher.len(), 64);
+        assert_eq!(stored_token.len(), 64);
+        assert_ne!(stored_teacher, teacher_key);
+        assert_ne!(stored_token, roster_token);
+        let read = service
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/classes/{class_id}"))
+                    .header("x-teacher-key", teacher_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = String::from_utf8(
+            read.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!body.contains(teacher_key));
+        assert!(!body.contains(roster_token));
+    }
+
+    #[tokio::test]
+    #[doc = "@claim:retention-delete"]
+    async fn claim_class_deletion_removes_all_related_records() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        migrate(&pool).await.unwrap();
+        let service = app(
+            AppState {
+                pool: pool.clone(),
+                signing_key: Arc::new(SigningKey::from_bytes(&[4u8; 32])),
+                build_sha: "test".into(),
+                rate_limits: Arc::new(Mutex::new(HashMap::new())),
+                demos: Arc::new(Mutex::new(HashMap::new())),
+                dist: Arc::new(PathBuf::new()),
+            },
+            std::env::temp_dir(),
+        );
+        let create = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/classes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"className":"Delete test","roster":["Fern 01"],"retentionDays":7}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let created = json_body(create).await;
+        let class_id = created["classId"].as_str().unwrap();
+        let teacher_key = created["teacherKey"].as_str().unwrap();
+        let start = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/classes/{class_id}/sessions"))
+                    .header("content-type", "application/json")
+                    .header("x-teacher-key", teacher_key)
+                    .body(Body::from(
+                        r#"{"lateAfterMinutes":10,"durationMinutes":60}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::CREATED);
+        let delete = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/classes/{class_id}"))
+                    .header("x-teacher-key", teacher_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete.status(), StatusCode::OK);
+        for table in ["classes", "roster", "sessions", "checkins"] {
+            let query = format!("SELECT COUNT(*) FROM {table}");
+            let count: i64 = sqlx::query_scalar(&query).fetch_one(&pool).await.unwrap();
+            assert_eq!(count, 0, "{table} retained rows after deletion");
+        }
+        let missing = service
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/classes/{class_id}"))
+                    .header("x-teacher-key", teacher_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let expired_at = Utc::now().timestamp() - 172_800;
+        sqlx::query("INSERT INTO classes(id,name,teacher_key_hash,retention_days,created_at) VALUES('expired','Expired class','hash',1,?)")
+            .bind(expired_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO roster(id,class_id,alias,token_hash,created_at) VALUES('expired-roster','expired','Fern 01','hash',?)")
+            .bind(expired_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        migrate(&pool).await.unwrap();
+        let expired_classes: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM classes WHERE id='expired'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let expired_roster: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM roster WHERE class_id='expired'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((expired_classes, expired_roster), (0, 0));
+    }
+
+    #[tokio::test]
+    #[doc = "@claim:tenant-isolation"]
+    async fn claim_teacher_keys_cannot_open_another_class() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        migrate(&pool).await.unwrap();
+        let service = app(
+            AppState {
+                pool,
+                signing_key: Arc::new(SigningKey::from_bytes(&[5u8; 32])),
+                build_sha: "test".into(),
+                rate_limits: Arc::new(Mutex::new(HashMap::new())),
+                demos: Arc::new(Mutex::new(HashMap::new())),
+                dist: Arc::new(PathBuf::new()),
+            },
+            std::env::temp_dir(),
+        );
+        let mut classes = Vec::new();
+        for name in ["Class alpha", "Class beta"] {
+            let response = service
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/classes")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"className":name,"roster":["Fern 01"],"retentionDays":7})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            classes.push(json_body(response).await);
+        }
+        let forbidden = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/classes/{}",
+                        classes[0]["classId"].as_str().unwrap()
+                    ))
+                    .header("x-teacher-key", classes[1]["teacherKey"].as_str().unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::UNAUTHORIZED);
+        let allowed = service
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/classes/{}",
+                        classes[0]["classId"].as_str().unwrap()
+                    ))
+                    .header("x-teacher-key", classes[0]["teacherKey"].as_str().unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[doc = "@claim:rate-limit"]
+    async fn claim_limits_each_forwarded_client_and_returns_retry_after() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        migrate(&pool).await.unwrap();
+        let service = app(
+            AppState {
+                pool,
+                signing_key: Arc::new(SigningKey::from_bytes(&[6u8; 32])),
+                build_sha: "test".into(),
+                rate_limits: Arc::new(Mutex::new(HashMap::new())),
+                demos: Arc::new(Mutex::new(HashMap::new())),
+                dist: Arc::new(PathBuf::new()),
+            },
+            std::env::temp_dir(),
+        );
+        for attempt in 0..31 {
+            let response = service
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/classes")
+                        .header("content-type", "application/json")
+                        .header("x-forwarded-for", "198.51.100.9, 10.0.0.4")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if attempt < 30 {
+                assert_ne!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            } else {
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+                assert!(response.headers().get(header::RETRY_AFTER).is_some());
+            }
+        }
+        let other_client = service
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/classes")
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", "203.0.113.10")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(other_client.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    #[doc = "@claim:restart-persistence"]
+    async fn claim_file_database_and_signing_identity_survive_restart() {
+        let root = std::env::temp_dir().join(format!("pcc-restart-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let database_url = format!("sqlite://{}?mode=rwc", root.join("checkin.db").display());
+        let (first_secret, first_source) = load_signing_secret(&database_url).unwrap();
+        assert_eq!(first_source, "generated");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        migrate(&pool).await.unwrap();
+        let service = app(
+            AppState {
+                pool: pool.clone(),
+                signing_key: Arc::new(SigningKey::from_bytes(
+                    &Sha256::digest(first_secret.as_bytes()).into(),
+                )),
+                build_sha: "test".into(),
+                rate_limits: Arc::new(Mutex::new(HashMap::new())),
+                demos: Arc::new(Mutex::new(HashMap::new())),
+                dist: Arc::new(PathBuf::new()),
+            },
+            root.clone(),
+        );
+        let created = json_body(service.oneshot(Request::builder().method("POST").uri("/api/classes").header("content-type", "application/json").body(Body::from(r#"{"className":"Restart class","roster":["Fern 01"],"retentionDays":7}"#)).unwrap()).await.unwrap()).await;
+        pool.close().await;
+        let (second_secret, second_source) = load_signing_secret(&database_url).unwrap();
+        assert_eq!(second_source, "persisted");
+        assert_eq!(first_secret, second_secret);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        migrate(&pool).await.unwrap();
+        let restarted = app(
+            AppState {
+                pool: pool.clone(),
+                signing_key: Arc::new(SigningKey::from_bytes(
+                    &Sha256::digest(second_secret.as_bytes()).into(),
+                )),
+                build_sha: "test".into(),
+                rate_limits: Arc::new(Mutex::new(HashMap::new())),
+                demos: Arc::new(Mutex::new(HashMap::new())),
+                dist: Arc::new(PathBuf::new()),
+            },
+            root.clone(),
+        );
+        let read = restarted
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/classes/{}",
+                        created["classId"].as_str().unwrap()
+                    ))
+                    .header("x-teacher-key", created["teacherKey"].as_str().unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+        pool.close().await;
+        fs::remove_dir_all(root).unwrap();
     }
 }

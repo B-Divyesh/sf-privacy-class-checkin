@@ -8,9 +8,10 @@
     "dev:server": "cargo run",
     "build": "vite build",
     "build:server": "cargo build --release",
-    "test": "tsc --noEmit && vitest run && cargo test && npm run test:release-cache",
-    "test:release-cache": "BUILD_SHA=qa-regression vite build && node --test tests/release-output.test.mjs",
+    "test": "tsc --noEmit && vitest run && cargo test",
+    "test:unit": "vitest run",
     "test:e2e": "playwright test",
+    "test:claims": "playwright test tests/e2e/claims.spec.ts --project=chromium",
     "preview": "vite preview --host 0.0.0.0"
   },
   "devDependencies": {

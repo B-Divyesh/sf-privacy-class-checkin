@@ -1,0 +1,107 @@
+[
+  {
+    "id": "demo-sandbox",
+    "claim": "The one-click sample shows 30 learners, persists on reload, resets, and never changes real browser data.",
+    "where": "landing first screen, demo banner, README",
+    "test": "npm run test:claims -- --grep '@claim:demo-sandbox'",
+    "sandbox": "fresh Chromium context; /demo; real-data sentinel; reset and reload"
+  },
+  {
+    "id": "class-checkin",
+    "claim": "A teacher can start a session and a learner can record one check-in with the current code and token.",
+    "where": "landing, README",
+    "test": "npm run test:claims -- --grep '@claim:class-checkin'",
+    "sandbox": "temporary pseudonymous class created and deleted during the test"
+  },
+  {
+    "id": "data-minimization",
+    "claim": "The demo makes only same-origin requests and camera, microphone, and geolocation access are denied.",
+    "where": "landing privacy facts, privacy page, README",
+    "test": "npm run test:claims -- --grep '@claim:data-minimization'",
+    "sandbox": "fresh Chromium request log for the complete demo check-in"
+  },
+  {
+    "id": "one-way-credentials",
+    "claim": "Teacher keys and roster tokens are stored as one-way hashes and are not returned after setup.",
+    "where": "how it works, teacher setup, privacy page, README",
+    "test": "cargo test claim_one_way_credentials_are_not_stored_or_returned_readable",
+    "sandbox": "in-memory SQLite; inspect stored values and authenticated read response"
+  },
+  {
+    "id": "rotating-code",
+    "claim": "Session codes change between 90-second time windows and stop accepting check-ins after closure.",
+    "where": "landing, teacher dashboard, README",
+    "test": "cargo test claim_rotating_code_and_closed_session_behavior",
+    "sandbox": "in-memory class; adjacent time buckets; close followed by a rejected check-in"
+  },
+  {
+    "id": "encrypted-export",
+    "claim": "The browser encrypts exports with AES-256-GCM and PBKDF2-SHA256 using 210,000 rounds.",
+    "where": "export panel, privacy page, README",
+    "test": "npm run test:unit -- --testNamePattern '@claim:encrypted-export'",
+    "sandbox": "Web Crypto round trip; inspect envelope parameters; reject wrong passphrase"
+  },
+  {
+    "id": "signed-export",
+    "claim": "A downloaded attendance export can be decrypted and its Ed25519 signature verified locally.",
+    "where": "how it works, export tool, README",
+    "test": "npm run test:claims -- --grep '@claim:signed-export'",
+    "sandbox": "in-memory demo export downloaded, opened, decrypted, and verified in Chromium"
+  },
+  {
+    "id": "manual-correction",
+    "claim": "A teacher can change a status by keyboard and the signed CSV labels the change as manual.",
+    "where": "how it works, teacher dashboard, README",
+    "test": "npm run test:claims -- --grep '@claim:manual-correction'",
+    "sandbox": "in-memory demo roster changed by keyboard and exported"
+  },
+  {
+    "id": "retention-delete",
+    "claim": "Deleting a class immediately removes related data, and retention cleanup removes expired classes.",
+    "where": "teacher dashboard, privacy page, README",
+    "test": "cargo test claim_class_deletion_removes_all_related_records",
+    "sandbox": "in-memory SQLite; delete and count related tables; expire a second class and run cleanup"
+  },
+  {
+    "id": "offline-shell",
+    "claim": "After one visit, public pages reopen offline; live check-ins still require a connection.",
+    "where": "landing facts, README",
+    "test": "npm run test:claims -- --grep '@claim:offline-shell'",
+    "sandbox": "dedicated fresh browser context; warm pages, set context offline, reload privacy"
+  },
+  {
+    "id": "cache-policy",
+    "claim": "Fingerprint assets cache for one year while pages and the service worker revalidate.",
+    "where": "README deployment notes",
+    "test": "npm run test:claims -- --grep '@claim:cache-policy'",
+    "sandbox": "production server response headers and generated fingerprinted hero URL"
+  },
+  {
+    "id": "paid-license",
+    "claim": "A recent valid one-time license enables printable cards while check-in and token downloads remain available.",
+    "where": "paid section, terms, README",
+    "test": "npm run test:claims -- --grep '@claim:paid-license'",
+    "sandbox": "temporary class; locally cached valid verdict; no checkout or payment call"
+  },
+  {
+    "id": "tenant-isolation",
+    "claim": "A teacher key for one class cannot read another class.",
+    "where": "README security notes",
+    "test": "cargo test claim_teacher_keys_cannot_open_another_class",
+    "sandbox": "two in-memory SQLite classes with crossed teacher keys"
+  },
+  {
+    "id": "rate-limit",
+    "claim": "API request limits use the first forwarded client address and return 429 with Retry-After without blocking another client.",
+    "where": "README deployment notes",
+    "test": "cargo test claim_limits_each_forwarded_client_and_returns_retry_after",
+    "sandbox": "in-process router; two forwarded client addresses"
+  },
+  {
+    "id": "restart-persistence",
+    "claim": "A file-backed class and generated signing identity remain available after restart.",
+    "where": "README deployment notes",
+    "test": "cargo test claim_file_database_and_signing_identity_survive_restart",
+    "sandbox": "temporary file-backed SQLite database opened by two sequential app instances"
+  }
+]

@@ -1,0 +1,1 @@
+Record class attendance with rotating codes and pseudonymous tokens, without location or biometric tracking.
