@@ -246,7 +246,7 @@ async fn rate_limit(State(state): State<AppState>, request: Request<Body>, next:
     } else if is_api {
         ("api-read", 80, Duration::from_secs(10))
     } else {
-        ("page", 180, Duration::from_secs(10))
+        ("page", 1_000, Duration::from_secs(10))
     };
     let key = format!("{forwarded}:{bucket}");
     let retry_after = {
